@@ -11,6 +11,7 @@ import struct
 import random
 import threading
 from datetime import datetime
+import webrtcvad  # NEW: pip install webrtcvad
 
 # GPIO Setup
 ROTARY_PIN = 17
@@ -122,7 +123,6 @@ def find_ring_audio():
     return None
 
 def get_timer():
-    """Get timer end time if set"""
     try:
         if os.path.exists(TIMER_FILE):
             with open(TIMER_FILE, 'r') as f:
@@ -136,7 +136,6 @@ def get_timer():
     return None
 
 def set_timer(minutes):
-    """Set a timer for X minutes from now"""
     try:
         end_time = time.time() + (minutes * 60)
         with open(TIMER_FILE, 'w') as f:
@@ -146,7 +145,6 @@ def set_timer(minutes):
         return False
 
 def clear_timer():
-    """Clear the timer"""
     try:
         if os.path.exists(TIMER_FILE):
             os.remove(TIMER_FILE)
@@ -154,7 +152,6 @@ def clear_timer():
         pass
 
 def get_last_random_call():
-    """Get timestamp of last random incoming call"""
     try:
         if os.path.exists(LAST_CALL_FILE):
             with open(LAST_CALL_FILE, 'r') as f:
@@ -164,7 +161,6 @@ def get_last_random_call():
     return 0
 
 def set_last_random_call():
-    """Record that a random call just happened"""
     try:
         with open(LAST_CALL_FILE, 'w') as f:
             f.write(str(time.time()))
@@ -172,27 +168,16 @@ def set_last_random_call():
         pass
 
 def should_random_call():
-    """Check if it's time for a random incoming call"""
     now = datetime.now()
     hour = now.hour
-    
-    # Only between 9am and 7pm
     if hour < 9 or hour >= 19:
         return False
-    
     last_call = get_last_random_call()
     hours_since_last = (time.time() - last_call) / 3600
-    
-    # Need at least 5 hours between calls
     if hours_since_last < 5:
         return False
-    
-    # Random chance - roughly 1-2 times per day during active hours
-    # 10 active hours, want 1-2 calls, so ~10-20% chance per hour check
-    # We check less frequently, so adjust probability
-    if random.random() < 0.02:  # 2% chance each check cycle
+    if random.random() < 0.02:
         return True
-    
     return False
 
 class RotaryPhone:
@@ -291,6 +276,35 @@ class VoiceHandler:
     def __init__(self):
         self.audio = pyaudio.PyAudio()
         self.recognizer = sr.Recognizer()
+        self.vad = webrtcvad.Vad(2)  # Aggressiveness: 0-3 (2 is balanced)
+        self.input_device_index = self._find_input_device()
+    
+    def _find_input_device(self):
+        """Find the input device index for the handset microphone"""
+        print("Searching for audio input devices...")
+        target_device = None
+        
+        for i in range(self.audio.get_device_count()):
+            info = self.audio.get_device_info_by_index(i)
+            name = info.get('name', '')
+            max_inputs = info.get('maxInputChannels', 0)
+            
+            print(f"  Device {i}: {name} (inputs: {max_inputs})")
+            
+            # Look for USB audio device or card 1 (adjust if needed)
+            if max_inputs > 0:
+                if 'usb' in name.lower() or 'card 1' in name.lower():
+                    target_device = i
+                    print(f"  -> Selected as input device")
+                elif target_device is None:
+                    # Fallback to first available input
+                    target_device = i
+        
+        if target_device is None:
+            print("Warning: No input device found, using default")
+            return None
+        
+        return target_device
     
     def play_tone(self, frequency=440, duration=0.3):
         try:
@@ -314,8 +328,131 @@ class VoiceHandler:
         except Exception as e:
             print(f"[Beep failed: {e}]")
     
-    def record_audio(self, filename="recording.wav", max_seconds=10, phone=None):
-        print("Recording... Speak now!")
+    def record_audio(self, filename="recording.wav", max_seconds=30, phone=None,
+                     silence_timeout=1.5, initial_wait=3.0):
+        """
+        Record audio with voice activity detection.
+        Records at 48kHz (device native) and resamples to 16kHz for VAD.
+        Stops recording after silence_timeout seconds of silence once speech is detected.
+        """
+        print("Recording with VAD... Speak now!")
+        
+        # Record at 48kHz (device native), resample to 16kHz for VAD
+        record_rate = 48000
+        vad_rate = 16000
+        downsample_factor = record_rate // vad_rate  # 3
+        
+        frame_duration_ms = 30  # webrtcvad supports 10, 20, or 30 ms
+        # Frame size for recording (at 48kHz)
+        record_frame_size = int(record_rate * frame_duration_ms / 1000)  # 1440 samples
+        # Frame size for VAD (at 16kHz)
+        vad_frame_size = int(vad_rate * frame_duration_ms / 1000)  # 480 samples
+        
+        try:
+            # Open audio stream at 48kHz
+            stream = self.audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=record_rate,
+                input=True,
+                input_device_index=self.input_device_index,
+                frames_per_buffer=record_frame_size
+            )
+            
+            frames = []
+            silence_frames = 0
+            speech_detected = False
+            initial_wait_frames = 0
+            
+            # Calculate frame limits
+            max_silence_frames = int(silence_timeout * 1000 / frame_duration_ms)
+            max_initial_frames = int(initial_wait * 1000 / frame_duration_ms)
+            max_total_frames = int(max_seconds * 1000 / frame_duration_ms)
+            
+            print(f"  Max silence frames: {max_silence_frames}")
+            print(f"  Max initial wait frames: {max_initial_frames}")
+            
+            for frame_count in range(max_total_frames):
+                # Check for hangup
+                if phone and phone.is_on_hook():
+                    print("Hung up - stopping recording")
+                    stream.stop_stream()
+                    stream.close()
+                    return None
+                
+                # Read audio frame at 48kHz
+                try:
+                    frame = stream.read(record_frame_size, exception_on_overflow=False)
+                except Exception as e:
+                    print(f"Read error: {e}")
+                    continue
+                
+                frames.append(frame)
+                
+                # Downsample to 16kHz for VAD analysis
+                try:
+                    # Unpack 48kHz samples
+                    samples_48k = struct.unpack(f'{record_frame_size}h', frame)
+                    # Simple downsampling: take every 3rd sample
+                    samples_16k = samples_48k[::downsample_factor]
+                    # Pack back to bytes for VAD
+                    frame_16k = struct.pack(f'{len(samples_16k)}h', *samples_16k)
+                    
+                    is_speech = self.vad.is_speech(frame_16k, vad_rate)
+                except Exception as e:
+                    # If VAD fails, fall back to energy detection
+                    audio_data = struct.unpack(f'{record_frame_size}h', frame)
+                    rms = math.sqrt(sum(x**2 for x in audio_data) / record_frame_size)
+                    is_speech = rms > 500
+                
+                if is_speech:
+                    if not speech_detected:
+                        print(f"  Speech detected at {frame_count * frame_duration_ms / 1000:.1f}s")
+                    speech_detected = True
+                    silence_frames = 0
+                else:
+                    if speech_detected:
+                        silence_frames += 1
+                        if silence_frames >= max_silence_frames:
+                            duration = len(frames) * frame_duration_ms / 1000
+                            print(f"  Silence detected - stopping after {duration:.1f}s")
+                            break
+                    else:
+                        # Still waiting for initial speech
+                        initial_wait_frames += 1
+                        if initial_wait_frames >= max_initial_frames:
+                            print("  No speech detected in initial wait period")
+                            # Still save what we have in case there was quiet speech
+                            break
+            
+            stream.stop_stream()
+            stream.close()
+            
+            if not frames:
+                print("No audio recorded")
+                return None
+            
+            # Save the recording at 48kHz
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(record_rate)
+                wf.writeframes(b''.join(frames))
+            
+            duration = len(frames) * frame_duration_ms / 1000
+            print(f"Recording complete! Duration: {duration:.1f}s")
+            self.play_tone(800, 0.3)
+            return filename
+            
+        except Exception as e:
+            print(f"Recording error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def record_audio_fallback(self, filename="recording.wav", max_seconds=10, phone=None):
+        """Fallback recording method using arecord (original method)"""
+        print("Recording (fallback)... Speak now!")
         try:
             cmd = ["arecord", "-D", HANDSET_DEVICE, "-f", "S16_LE", "-r", "48000", "-c", "1", "-d", str(max_seconds), filename]
             if phone:
@@ -565,14 +702,12 @@ def play_music_directory(voice, phone):
     os.remove(dir_audio)
 
 def play_ring_and_wait(ring_audio, phone, timeout=20):
-    """Play ring audio on internal speaker, return True if picked up"""
     if not ring_audio:
         return False
     
     print("RINGING...")
     vol = get_internal_volume()
     
-    # Prepare boosted ring audio
     temp_wav = "/tmp/ring_temp.wav"
     temp_loud = "/tmp/ring_loud.wav"
     
@@ -586,7 +721,6 @@ def play_ring_and_wait(ring_audio, phone, timeout=20):
     picked_up = False
     
     while time.time() - start_time < timeout:
-        # Play ring once
         process = subprocess.Popen(["aplay", "-D", INTERNAL_DEVICE, temp_loud],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
@@ -600,7 +734,6 @@ def play_ring_and_wait(ring_audio, phone, timeout=20):
         if picked_up:
             break
         
-        # Brief pause between rings
         pause_start = time.time()
         while time.time() - pause_start < 2:
             if phone.is_off_hook():
@@ -611,7 +744,6 @@ def play_ring_and_wait(ring_audio, phone, timeout=20):
         if picked_up:
             break
     
-    # Cleanup
     try:
         os.remove(temp_wav)
         os.remove(temp_loud)
@@ -622,16 +754,13 @@ def play_ring_and_wait(ring_audio, phone, timeout=20):
     return picked_up
 
 def handle_incoming_call(phone, voice, llm, ring_audio):
-    """Handle a random incoming call"""
     print("\n=== INCOMING CALL ===")
     
     if play_ring_and_wait(ring_audio, phone, timeout=20):
         time.sleep(0.5)
         
-        # Pick a random scenario
         scenario = random.choice(CALL_SCENARIOS)
         
-        # Set up LLM with the scenario
         llm.conversation_history = []
         llm.system_prompt = f"""You are making a phone call. {scenario}
 Keep your responses short and conversational (1-3 sentences).
@@ -639,18 +768,16 @@ Stay in character throughout the call.
 Don't use special characters or formatting.
 If they seem confused or want to end the call, politely say goodbye."""
         
-        # LLM starts the conversation
         opener = llm.send_message("You just called and someone picked up. Start the conversation.")
         opener_audio = voice.text_to_speech(opener, "caller_opener.wav")
         voice.play_audio(opener_audio, check_hangup=True, phone=phone)
         os.remove(opener_audio)
         
-        # Conversation loop
         turn = 0
         while turn < 10 and phone.is_off_hook():
             turn += 1
             
-            audio_file = voice.record_audio(max_seconds=15, phone=phone)
+            audio_file = voice.record_audio(max_seconds=30, phone=phone)
             if not audio_file:
                 break
             
@@ -673,7 +800,6 @@ If they seem confused or want to end the call, politely say goodbye."""
             
             os.remove(audio_file)
         
-        # Reset LLM system prompt
         llm.system_prompt = """You are an AI assistant on a rotary phone call. Keep these guidelines in mind:
 - Keep responses concise and conversational (2-4 sentences typically)
 - Speak naturally as if on a phone call
@@ -689,7 +815,6 @@ If they seem confused or want to end the call, politely say goodbye."""
     return False
 
 def handle_timer_ring(phone, voice, ring_audio):
-    """Handle timer going off"""
     print("\n=== TIMER ALARM ===")
     
     if play_ring_and_wait(ring_audio, phone, timeout=30):
@@ -801,6 +926,11 @@ def main():
     ring_audio = find_ring_audio()
     
     print("Rotary Phone LLM Interface Ready!")
+    print("=" * 40)
+    print("NEW: Voice Activity Detection enabled!")
+    print("Recording stops automatically when you")
+    print("stop talking (after 1.5s of silence)")
+    print("=" * 40)
     print("Dial 0 for directory")
     print("Dial 411 for AI assistant")
     print("Dial 611 for music directory")
@@ -981,11 +1111,10 @@ def main():
                         phone.pulse_count = 0
                         start_time = time.time()
                         
-                        # Wait for digits (up to 10 seconds of inactivity)
                         while time.time() - start_time < 10 and phone.is_off_hook():
                             phone.detect_pulse()
                             if phone.dialed_number:
-                                start_time = time.time()  # Reset timeout when digit received
+                                start_time = time.time()
                             if phone.dialed_number and (time.time() - phone.last_change_time) > 2:
                                 break
                             time.sleep(0.01)
@@ -1028,7 +1157,11 @@ def main():
                     print("\n=== CALL CONNECTED ===")
                     llm.reset_conversation()
                     
-                    inst = voice.text_to_speech("You have 15 seconds to speak. A beep signals when time is up.", "inst.wav")
+                    # Updated instruction - no more 15 second limit!
+                    inst = voice.text_to_speech(
+                        "Speak naturally. I will respond when you pause.",
+                        "inst.wav"
+                    )
                     voice.play_audio(inst, check_hangup=True, phone=phone)
                     os.remove(inst)
                     
@@ -1041,7 +1174,8 @@ def main():
                     turn = 0
                     while turn < 20 and phone.is_off_hook():
                         turn += 1
-                        audio_file = voice.record_audio(max_seconds=15, phone=phone)
+                        # VAD-enabled recording - stops when you stop talking
+                        audio_file = voice.record_audio(max_seconds=30, phone=phone)
                         if not audio_file:
                             break
                         
